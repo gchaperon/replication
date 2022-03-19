@@ -66,3 +66,11 @@ Again, some were determined by inspecting the average tour distance.
 Here is the list of changes I did to the original paper description
 
 * Optimizer: SGD to Adam. I obtained similar results with both but Adam converged faster.
+
+# Differences with https://github.com/devsisters/pointer-network-tensorflow
+1. el input (la secuencia de puntos) lo pasa por una capa lineal, ver https://github.com/devsisters/pointer-network-tensorflow/blob/f3956d6786c9d401d100e4c09a248b5d185d09fb/model.py#L104
+2. el estado inicial del encoder es entrenable parece, ver https://github.com/devsisters/pointer-network-tensorflow/blob/f3956d6786c9d401d100e4c09a248b5d185d09fb/model.py#L116
+3. el primer vector sobre el que se hace atencion (bos token o <= en el paper, `first_decoder_input` en el codigo) tambien es entrenable parece, ver https://github.com/devsisters/pointer-network-tensorflow/blob/f3956d6786c9d401d100e4c09a248b5d185d09fb/model.py#L124
+4. la entrada al decoder es una permutacion de los **estados escondidos** del encoder (incluyendo el `first_decoder_input`) en vez de una permutacion de los **inputs del encoder** (vectores de largo 2 representando puntos), ver https://github.com/devsisters/pointer-network-tensorflow/blob/f3956d6786c9d401d100e4c09a248b5d185d09fb/model.py#L133
+5. parece que tanto el bos token (=> en el paper) y el eos token (<= en el paper) son el mismo vector `first_decoder_input`, ver https://github.com/devsisters/pointer-network-tensorflow/blob/f3956d6786c9d401d100e4c09a248b5d185d09fb/model.py#L141
+6. por alguna razon cuando reordena los estados escondidos del encoder para obtener el input al decoder usa la funcion `tf.stop_gradient` (que entiendo que funciona como `torch.Tensor.detach` en pytorch), ver https://github.com/devsisters/pointer-network-tensorflow/blob/f3956d6786c9d401d100e4c09a248b5d185d09fb/model.py#L133 y https://github.com/devsisters/pointer-network-tensorflow/blob/f3956d6786c9d401d100e4c09a248b5d185d09fb/layers.py#L71
