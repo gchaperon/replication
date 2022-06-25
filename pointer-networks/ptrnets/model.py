@@ -4,6 +4,7 @@ from torch.nn.utils.rnn import PackedSequence
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import ptrnets
+import functools
 import operator
 import typing as tp
 import ptrnets.metrics as metrics
@@ -21,42 +22,45 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        encoder_output: PackedSequence,
-        decoder_output: PackedSequence,
+        encoder_output: tp.Union[torch.Tensor, PackedSequence],
+        decoder_output: tp.Union[torch.Tensor, PackedSequence],
     ) -> PackedSequence:
-        if isinstance(encoder_output, PackedSequence) and isinstance(
-            decoder_output, PackedSequence
-        ):
-            encoder_output = encoder_output._replace(data=encoder_output.data @ self.W1)
-            decoder_output = decoder_output._replace(data=decoder_output.data @ self.W2)
-            # shape: (max_dec_seq_len, batch, hidden)
-            encoder_unpacked, encoder_lens = nn.utils.rnn.pad_packed_sequence(
-                encoder_output
-            )
-            # shape: (max_enc_seq_len, batch, hidden)
-            decoder_unpacked, decoder_lens = nn.utils.rnn.pad_packed_sequence(
-                decoder_output
-            )
-            # TODO: maybe mask padded positions?
-            # shape: (max_dec_seq_len, max_enc_sec_len, batch)
-            scores = (
-                self.activation(decoder_unpacked.unsqueeze(1) + encoder_unpacked)
-                @ self.v
-            )
-            return nn.utils.rnn.pack_padded_sequence(
-                scores.transpose(1, 2), lengths=decoder_lens, enforce_sorted=False
-            )
-        else:
-            # encoder_output: (enc_seq_len, batch, hidden)
-            # decoder_output: (dec_seq_len, batch, hidden)
-            # scores: (dec_seq_len, enc_sec_len, batch)
-            scores = (
-                self.activation(
-                    encoder_output @ self.W1 + (decoder_output @ self.W2).unsqueeze(1)
-                )
-                @ self.v
-            )
-            return scores.transpose(1, 2)
+        # treat everything as PackedSequence
+        if isinstance(encoder_output, torch.Tensor):
+            encoder_output = nn.utils.rnn.pack_sequence(encoder_output.unbind(1))
+        if isinstance(decoder_output, torch.Tensor):
+            decoder_output = nn.utils.rnn.pack_sequence(decoder_output.unbind(1))
+
+        assert (
+            encoder_output.batch_sizes[0] == decoder_output.batch_sizes[0]
+        ), "batch_size missmatch"
+
+        encoder_output = encoder_output._replace(data=encoder_output.data @ self.W1)
+        decoder_output = decoder_output._replace(data=decoder_output.data @ self.W2)
+        # shape: (max_enc_seq_len, batch, hidden)
+        encoder_unpacked, encoder_lens = nn.utils.rnn.pad_packed_sequence(
+            encoder_output
+        )
+        # shape: (max_dec_seq_len, batch, hidden)
+        decoder_unpacked, decoder_lens = nn.utils.rnn.pad_packed_sequence(
+            decoder_output
+        )
+        # TODO: maybe mask padded positions, in dim max_enc_sec_len?
+        # shape: (max_dec_seq_len, max_enc_sec_len, batch)
+        scores = (
+            self.activation(decoder_unpacked.unsqueeze(1) + encoder_unpacked) @ self.v
+        )
+        # mask padded positions in dim max_enc_sec_len
+        max_enc_len = len(encoder_output.batch_sizes)
+        batch_size = encoder_output.batch_sizes[0]
+        scores[
+            :,
+            torch.arange(max_enc_len)[:, None].expand(max_enc_len, batch_size)
+            >= encoder_lens,
+        ] = -torch.inf
+        return nn.utils.rnn.pack_padded_sequence(
+            scores.transpose(1, 2), lengths=decoder_lens, enforce_sorted=False
+        )
 
 
 def _prepend(sequences: PackedSequence, tensor: torch.Tensor) -> PackedSequence:
@@ -242,18 +246,30 @@ class PointerNetwork(pl.LightningModule):
         #     metrics.sequence_accuracy(prediction, target_w_end_token),
         #     batch_size=target.batch_sizes[0],
         # )
+        decoded = self.batch_beam_search(encoder_input)
+        pad = functools.partial(
+            nn.utils.rnn.pad_packed_sequence,
+            total_length=encoder_input.batch_sizes.shape[0] + 2,
+        )
+
+        batch_size = target.batch_sizes[0]
+        decoded_acc = pad(decoded)[0].eq(pad(target)[0]).all(0).sum() / batch_size
         self.log_dict(
             {
-                "test/loss": self._get_loss(prediction, target_w_end_token),
-                "test/token_acc": metrics.token_accuracy(
+                "test/teacher_forcing_loss": self._get_loss(
                     prediction, target_w_end_token
                 ),
-                "test/sequence_acc": metrics.sequence_accuracy(
+                "test/teacher_forcing_token_acc": metrics.token_accuracy(
                     prediction, target_w_end_token
                 ),
+                "test/teacher_forcing_sequence_acc": metrics.sequence_accuracy(
+                    prediction, target_w_end_token
+                ),
+                "test/decoded_sequence_acc": decoded_acc,
             },
             batch_size=prediction.batch_sizes[0],
         )
+
         return encoder_input, target
 
     def _test_step_old(
@@ -395,6 +411,165 @@ class PointerNetworkForConvexHull(PointerNetwork):
         # NOTE: remove 0 index at the end to match :class:`ptrnsets.data.ConvexHull`
         # format
         return beams[0].indices[:-1]
+
+    @torch.no_grad()
+    def batch_greedy_decode(self, inputs: PackedSequence) -> PackedSequence:
+        """inputs of shape (B, L_in*, 2), outuput of shape (B, L_out*), both as
+        packed sequence
+
+        This works exactly the same as teacher forcing, which is expected.
+        """
+        # +2 because solution has to loop and then add 0
+        max_len = len(inputs.batch_sizes) + 2
+        batch_size = inputs.batch_sizes[0]
+        encoder_output, last_hidden = self.encoder(
+            inputs,
+            (
+                self.end_symbol.repeat(1, batch_size, 1),
+                self.encoder_c_0.repeat(1, batch_size, 1),
+            ),
+        )
+        encoder_output = _prepend(encoder_output, self.end_symbol)
+
+        decoder_input = self.start_symbol.repeat(1, batch_size, 1)
+
+        predictions = []
+
+        for _ in range(max_len):
+            _, last_hidden = self.decoder(decoder_input, last_hidden)
+
+            scores = self.attention(
+                encoder_output, nn.utils.rnn.pack_sequence(last_hidden[0].unbind(1))
+            )
+            scores_padded, _ = nn.utils.rnn.pad_packed_sequence(scores)
+            indices = scores_padded.argmax(2)
+            decoder_input = nn.utils.rnn.pad_packed_sequence(inputs)[0][
+                indices - 1, torch.arange(batch_size)
+            ]
+            predictions.append(indices)
+            if (torch.cat(predictions) == 0).any(0).all():
+                break
+        else:
+            # if decoding finished without breaking, add prediction of only
+            # zeroes to keep format consistent
+            predictions.append(torch.zeros_like(predictions[0]))
+
+        predictions = torch.cat(predictions)
+        # find indices of
+        _, lens = torch.min(predictions, dim=0)
+        return nn.utils.rnn.pack_padded_sequence(
+            predictions, lens, enforce_sorted=False
+        )
+
+    @torch.no_grad()
+    def single_beam_search(inputs: PackedSequence, nbeams: int = 3) -> PackedSequence:
+        batch_size = inputs.batch_sizes[0]
+        assert batch_size == 1
+
+        import numpy as np
+
+        pad = torch.nn.utils.rnn.pad_packed_sequence
+
+    @torch.no_grad()
+    def batch_beam_search(
+        self, inputs: PackedSequence, nbeams: int = 3
+    ) -> PackedSequence:
+        import numpy as np
+
+        pad = torch.nn.utils.rnn.pad_packed_sequence
+        max_decode_len = len(inputs.batch_sizes) + 2
+        batch_size = inputs.batch_sizes[0]
+        max_input_len = len(inputs.batch_sizes)
+        # assert batch_size == 1
+        # TODO: esta wea esta mal, los inputs del decoder tienen que ir repetidos
+        # pa los nbeams
+
+        # expand input
+        input_padded, input_lens = nn.utils.rnn.pad_packed_sequence(inputs)
+        inputs = nn.utils.rnn.pack_padded_sequence(
+            input_padded.repeat(1, nbeams, 1),
+            input_lens.repeat(nbeams),
+            enforce_sorted=False,
+        )
+
+        encoder_output, last_hidden = self.encoder(
+            inputs,
+            (
+                self.end_symbol.repeat(1, batch_size * nbeams, 1),
+                self.encoder_c_0.repeat(1, batch_size * nbeams, 1),
+            ),
+        )
+        encoder_output = _prepend(encoder_output, self.end_symbol)
+
+        decoder_input = self.start_symbol.repeat(1, batch_size * nbeams, 1)
+
+        # (L*, nbeams, b_size)
+        beams = torch.empty(0, nbeams, batch_size)
+        # (nbeams, b_size)
+        beam_scores = torch.tensor([[0.0, torch.inf, torch.inf]]).T.repeat(
+            1, batch_size
+        )
+
+        # loop step,
+        for i in range(max_decode_len):
+            _, last_hidden = self.decoder(decoder_input, last_hidden)
+            attention_scores = self.attention(
+                encoder_output, nn.utils.rnn.pack_sequence(last_hidden[0].unbind(1))
+            )
+            # (nbeams, b_size, max_input_len+1)
+            scores_padded = nn.utils.rnn.pad_packed_sequence(attention_scores)[0][
+                0
+            ].view(nbeams, batch_size, -1)
+            # finished beams should predict 0s with score 0, as to keep the previous
+            # beam score
+            # (nbeams, b_size)
+            finished_mask = (beams == 0).any(0)
+            # (nbeams, b_size, max_input_len)
+            scores_padded[
+                finished_mask[..., None] & (torch.arange(max_input_len + 1) != 0)
+            ] = -torch.inf
+            # (nbeams, b_size, max_input_len)
+            probs = scores_padded.softmax(2)
+            new_beam_scores = beam_scores[..., None] - torch.log(probs)
+            topk_scores, indices = (
+                new_beam_scores.transpose(0, 1)
+                .reshape(batch_size, -1)
+                .topk(k=nbeams, dim=1, largest=False)
+            )
+            # indices = torch.from_numpy(
+            #     np.stack(np.unravel_index(indices, scores_padded.shape), axis=1)
+            # )
+            beam_origin, index_prediction = map(
+                torch.from_numpy, np.unravel_index(indices, (nbeams, max_input_len + 1))
+            )
+
+            beams = torch.cat(
+                [beams[:, beam_origin.T, torch.arange(4)], index_prediction.T[None]]
+            )
+            # beams = torch.vstack([beams[:, indices[:, 0]], indices[:, 1]])
+            beam_scores = topk_scores.T
+            last_hidden = (
+                last_hidden[0]
+                .view(1, 3, 4, -1)[:, beam_origin.T, torch.arange(batch_size)]
+                .reshape(1, 12, -1),
+                last_hidden[1]
+                .view(1, 3, 4, -1)[:, beam_origin.T, torch.arange(batch_size)]
+                .reshape(1, 12, -1),
+            )
+            decoder_input = nn.utils.rnn.pad_packed_sequence(inputs)[0][
+                None, index_prediction.view(-1) - 1, torch.arange(nbeams * batch_size)
+            ]
+            if (beams == 0).any(0).all():
+                break
+        else:
+            beams = torch.cat([beams, torch.zeros(1, nbeams, batch_size, dtype=int)])
+            # leave beam_scores as they are
+        # breakpoint()
+
+        _, min_beam = torch.min(beam_scores, dim=0)
+        winner = beams[:, min_beam]
+        _, beam_len = torch.min(winner, dim=0)
+        return nn.utils.rnn.pack_sequence([winner[:beam_len]])
 
     def test_epoch_end(
         self,
